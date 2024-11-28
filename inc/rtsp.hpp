@@ -15,14 +15,53 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "rtsp.hpp"
+#include "h264.h"
+#include "rtp_packet.hpp"
+
+#include <cassert>
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <iostream>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <sstream>
+#include <thread>
+
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <opencv2/opencv.hpp> // OpenCV 사용
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/avutil.h>
+#include <libavutil/imgutils.h>
+}
+
 constexpr uint16_t SERVER_RTP_PORT = 12345;
 constexpr uint16_t SERVER_RTCP_PORT = SERVER_RTP_PORT + 1;
 constexpr uint16_t SERVER_RTSP_PORT = 8554;
 
 class RTSP
 {
+public :
+    // RTSP
+    const char *file_name = "example/colorTest.png";
+    const char *codec_name = "libx264";
+    const AVCodec *codec;
+    AVCodecContext *c;
+    int i, ret, x, y;
+    FILE *f;
+
 private:
-    H264Parser h264_file;
+    //H264Parser h264_file;
     
     int server_rtsp_sock_fd{-1};
     int server_rtp_sock_fd{-1};
@@ -48,7 +87,8 @@ private:
     static int64_t push_stream(int sockfd, RtpPacket &rtpPack, const uint8_t *data, int64_t dataSize, const sockaddr *to, uint32_t timeStampStep);
 
 public:
-    explicit RTSP(const char *filename);
+    explicit RTSP(const char *filename, int width, int height, int fps, AVPixelFormat pix_fmt);
+
     ~RTSP();
 
     void Start(int ssrcNum, const char *sessionID, int timeout, float fps);

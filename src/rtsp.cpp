@@ -15,9 +15,94 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <sstream>
+#include <thread>
 
-RTSP::RTSP(const char *filename) : h264_file(filename)
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <opencv2/opencv.hpp> // OpenCV 사용
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/avutil.h>
+#include <libavutil/imgutils.h>
+}
+#define OUTPUT_FILENAME "output.h264"
+
+// Function to read a PNG image and convert it to YUV format
+std::vector<uint8_t> convertPNGToYUV420P(const std::string &filename, int &width, int &height) {
+    // Load the PNG image
+    cv::Mat img = cv::imread(filename, cv::IMREAD_COLOR);
+    if (img.empty()) {
+        throw std::runtime_error("Failed to read the PNG image.");
+    }
+
+    // Original dimensions
+    int original_width = img.cols;
+    int original_height = img.rows;
+
+    // Ensure even dimensions for YUV420P
+    if (original_width % 2 != 0 || original_height % 2 != 0) {
+        cv::resize(img, img, cv::Size(original_width & ~1, original_height & ~1));
+    }
+
+    // Set output width and height
+    width = img.cols;
+    height = img.rows;
+
+    // Convert BGR to YUV420
+    cv::Mat img_yuv;
+    cv::cvtColor(img, img_yuv, cv::COLOR_BGR2YUV_I420);
+
+    // Prepare YUV420P buffer
+    size_t y_size = width * height;              // Luminance (Y)
+    size_t uv_size = y_size / 4;                 // Chrominance (U and V)
+    std::vector<uint8_t> yuv_buffer(y_size + 2 * uv_size);
+
+    // Split Y, U, and V planes
+    uint8_t *y_plane = img_yuv.data;
+    uint8_t *u_plane = y_plane + y_size;
+    uint8_t *v_plane = u_plane + uv_size;
+
+    // Copy data into vector
+    std::memcpy(yuv_buffer.data(), y_plane, y_size);                      // Copy Y plane
+    std::memcpy(yuv_buffer.data() + y_size, u_plane, uv_size);            // Copy U plane
+    std::memcpy(yuv_buffer.data() + y_size + uv_size, v_plane, uv_size);  // Copy V plane
+
+    return yuv_buffer;
+}
+
+RTSP::RTSP(const char *filename, int width, int height, int fps, AVPixelFormat pix_fmt) /*: h264_file(filename)*/ 
 {
+    av_log_set_level(AV_LOG_DEBUG);
+
+    codec = avcodec_find_encoder_by_name(codec_name);
+    if(!codec) {
+        std::cerr << "Codec not found." << std::endl;
+        exit(0);
+    }
+    c = avcodec_alloc_context3(codec);
+    if(!c) {
+        std::cerr << "Codec not allocate codec context." << std::endl;
+        exit(0);
+    }
+
+
+    // Set codec parameters
+    c->bit_rate = 400000;
+    c->width = width;
+    c->height = height;
+    c->time_base = {1, fps};
+    c->framerate = {fps, 1};
+
+    c->gop_size = 10;
+    c->max_b_frames = 1;
+    c->pix_fmt = pix_fmt;
+
+    //if (codec->id == AV_CODEC_ID_H264) {
+    //    av_dict_set(codec_ctx->priv_data, "preset", "ultrafast", 0);
+    //}
+
 }
 
 RTSP::~RTSP()
@@ -127,60 +212,229 @@ char *RTSP::line_parser(char *src, char *line)
     *(++line) = 0;
     return (src + 1);
 }
+std::string ParseMethod(const std::string& request) {
+    std::istringstream requestStream(request);
+    std::string method;
+    requestStream >> method;
+    return method;
+}
+
+int ParseCSeq(const std::string& request) {
+    std::istringstream requestStream(request);
+    std::string line;
+    while (getline(requestStream, line)) {
+        if (line.find("CSeq") != std::string::npos) {
+            std::istringstream lineStream(line);
+            std::string label;
+            int cseq;
+            lineStream >> label >> cseq;
+            return cseq;
+        }
+    }
+    return -1; // CSeq not found
+}
+
+std::pair<int, int> ParsePorts(const std::string& request) {
+    std::istringstream requestStream(request);
+    std::string line;
+    while (getline(requestStream, line)) {
+        if (line.find("client_port=") != std::string::npos) {
+            std::istringstream lineStream(line);
+            std::string label;
+
+            while (getline(lineStream, label, '/')) {
+                std::string portRange;
+                getline(lineStream, portRange);
+                size_t eqPos = portRange.find('=') + 1;
+                size_t dashPos = portRange.find('-');
+
+                if (dashPos != std::string::npos) {
+                    
+                    int rtpPort = stoi(portRange.substr(eqPos, dashPos - eqPos));
+                    int rtcpPort = stoi(portRange.substr(dashPos + 1));
+		            return {rtpPort, rtcpPort};
+                }
+            }
+        }
+    }
+    return {-1, -1};
+}
+
+static void encode(AVCodecContext *enc_ctx, AVFrame *frame, AVPacket *pkt, FILE *outfile)
+{
+    int ret;
+    /* send the frame to the encoder */
+    if (frame)
+        printf("Send frame %3 PRId64 \n", frame->pts);
+    ret = avcodec_send_frame(enc_ctx, frame);
+    if (ret < 0) {
+        fprintf(stderr, "Error sending a frame for encoding\n");
+        exit(1);
+    }
+
+    while (ret >= 0) {
+        ret = avcodec_receive_packet(enc_ctx, pkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+            return;
+        else if (ret < 0) {
+            fprintf(stderr, "Error during encoding\n");
+            exit(1);
+        }
+        printf("Write packet %3 PRId64 (size=%5d)\n", pkt->pts, pkt->size);
+        fwrite(pkt->data, 1, pkt->size, outfile);
+        av_packet_unref(pkt);
+    }
+}
+
+// RTP 전송 함수
+void send_rtp_packet(int sockfd, struct sockaddr_in &clientSock, uint8_t *data, int size, uint16_t &sequence, uint32_t timestamp, uint32_t ssrc) {
+    uint8_t rtp_header[12] = {0};
+    rtp_header[0] = 0x80; // Version 2, no padding, no extension, 0 CSRCs
+    rtp_header[1] = 0x60; // Payload type 96 (dynamic), no marker bit
+    rtp_header[2] = (sequence >> 8) & 0xFF; // Sequence number high byte
+    rtp_header[3] = sequence & 0xFF;        // Sequence number low byte
+    rtp_header[4] = (timestamp >> 24) & 0xFF;
+    rtp_header[5] = (timestamp >> 16) & 0xFF;
+    rtp_header[6] = (timestamp >> 8) & 0xFF;
+    rtp_header[7] = timestamp & 0xFF;
+    rtp_header[8] = (ssrc >> 24) & 0xFF;
+    rtp_header[9] = (ssrc >> 16) & 0xFF;
+    rtp_header[10] = (ssrc >> 8) & 0xFF;
+    rtp_header[11] = ssrc & 0xFF;
+
+    uint8_t rtp_packet[1500]; // RTP 패킷 버퍼
+    int max_payload_size = 1400; // RTP 페이로드 크기 제한 (MTU 고려)
+
+    if (size <= max_payload_size) {
+        // 단일 RTP 패킷
+        memcpy(rtp_packet, rtp_header, 12);
+        memcpy(rtp_packet + 12, data, size);
+        sendto(sockfd, rtp_packet, 12 + size, 0, (struct sockaddr *)&clientSock, sizeof(clientSock));
+        sequence++;
+    } else {
+        // NAL 단위를 조각내어 전송 (FU-A 형식)
+        uint8_t nal_header = data[0]; // 첫 바이트는 NAL 헤더
+        uint8_t nal_type = nal_header & 0x1F; // NAL 유형 추출
+        uint8_t fu_indicator = (nal_header & 0xE0) | 28; // FU-A 표시자
+        int remaining = size - 1;
+        uint8_t *nal_data = data + 1;
+        bool start = true, end = false;
+
+        while (remaining > 0) {
+            int chunk_size = std::min(max_payload_size - 2, remaining);
+            uint8_t fu_header = nal_type;
+            if (start) {
+                fu_header |= 0x80; // Start bit
+                start = false;
+            }
+            if (remaining == chunk_size) {
+                fu_header |= 0x40; // End bit
+                end = true;
+            }
+
+            memcpy(rtp_packet, rtp_header, 12);
+            rtp_packet[12] = fu_indicator;
+            rtp_packet[13] = fu_header;
+            memcpy(rtp_packet + 14, nal_data, chunk_size);
+
+            sendto(sockfd, rtp_packet, 14 + chunk_size, 0, (struct sockaddr *)&clientSock, sizeof(clientSock));
+            sequence++;
+            remaining -= chunk_size;
+            nal_data += chunk_size;
+        }
+    }
+}
+
+void stream_h264_rtp(const std::string &file_name, struct sockaddr_in &clientSock, int sockfd, uint16_t client_rtp_port) {
+    // RTP 관련 변수
+    static uint16_t sequence = 0;
+    static uint32_t timestamp = 0;
+    const uint32_t ssrc = 12345678; // SSRC (고유 값)
+    const uint32_t timeStampStep = 90000 / 25; // 25fps 기준
+
+    // 클라이언트 포트 설정
+    clientSock.sin_port = htons(client_rtp_port);
+
+    // H.264 파일 열기
+    FILE *f = fopen(file_name.c_str(), "rb");
+    if (!f) {
+        std::cerr << "Failed to open H.264 file: " << file_name << std::endl;
+        return;
+    }
+
+    uint8_t buffer[1500];
+    while (!feof(f)) {
+        // NAL 단위 읽기
+        int nal_size = fread(buffer, 1, sizeof(buffer), f);
+        if (nal_size <= 0) {
+            break;
+        }
+
+        // RTP 패킷 전송
+        send_rtp_packet(sockfd, clientSock, buffer, nal_size, sequence, timestamp, ssrc);
+
+        // 타임스탬프 업데이트
+        timestamp += timeStampStep;
+
+        // Sleep to simulate frame timing
+        usleep(1000 * 1000 / 25); // 25fps 기준
+    }
+
+    fclose(f);
+}
 
 void RTSP::serve_client(int clientfd, const sockaddr_in &cliAddr, int rtpFD, const int ssrcNum, const char *sessionID, const int timeout, const float fps)
 {
-    char method[10]{0};
     char url[100]{0};
     char version[10]{0};
     char line[500]{0};
     int cseq;
     int64_t heartbeatCount = 0;
     char recvBuf[1024]{0}, sendBuf[1024]{0};
+
+
+
     while (true)
     {
         auto recvLen = recv(clientfd, recvBuf, sizeof(recvBuf), 0);
         if (recvLen <= 0)
             break;
         recvBuf[recvLen] = 0;
+
+        fprintf(stdout,"TestStart\n");
         fprintf(stdout, "--------------- [C->S] --------------\n");
         fprintf(stdout, "%s", recvBuf);
+        fprintf(stdout,"Test000\n");
 
+
+        //Request buffer
+        std::string method = ParseMethod(recvBuf);
+        int cseq = ParseCSeq(recvBuf);
+
+        fprintf(stdout,"Test001\n");
         char *bufferPtr = RTSP::line_parser(recvBuf, line);
 
-        if (sscanf(line, "%s %s %s\r\n", method, url, version) != 3) {
-            fprintf(stdout, "RTSP::line_parser() parse method error\n");
-            break;
-        }
+        fprintf(stdout,"Test002\n");
+        memcpy(url, "rtsp:127.0.0.1:8554", sizeof(7));
 
-        bufferPtr = RTSP::line_parser(bufferPtr, line);
-        if (sscanf(line, "CSeq: %d\r\n", &cseq) != 1) {
-            fprintf(stdout, "RTSP::line_parser() parse seq error\n");
-            break;
-        }
-  
-        if (!strcmp(method, "SETUP")) {
-            while (true) {
-                bufferPtr = RTSP::line_parser(bufferPtr, line);
-                if (!strncmp(line, "Transport:", strlen("Transport:"))) {
-                    sscanf(line, "Transport: RTP/AVP;unicast;client_port=%d-%d\r\n", &this->client_rtp_port, &this->client_rtcp_port);
-                    break;
-                }
-            }
-        }
-
-        if (!strcmp(method, "OPTIONS")) {
+        if (method == "OPTIONS") {
             RTSP::replyCmd_OPTIONS(sendBuf, sizeof(sendBuf), cseq);
-        } else if (!strcmp(method, "DESCRIBE")) {
+        } else if (method =="DESCRIBE") {
             RTSP::replyCmd_DESCRIBE(sendBuf, sizeof(sendBuf), cseq, url);
-        } else if (!strcmp(method, "SETUP")) {
+        } else if (method == "SETUP") {
+            auto ports = ParsePorts(recvBuf);
+            this->client_rtp_port = ports.first;
+            this->client_rtcp_port = ports.second;
+
             RTSP::replyCmd_SETUP(sendBuf, sizeof(sendBuf), cseq, this->client_rtp_port, ssrcNum, sessionID, timeout);
-        } else if (!strcmp(method, "PLAY")) {
+        } else if (method == "PLAY") {
             RTSP::replyCmd_PLAY(sendBuf, sizeof(sendBuf), cseq, sessionID, timeout);
         } else {
             fprintf(stderr, "Parse method error\n");
             break;
-        }
+        }        
+        fprintf(stdout,"Test003\n");
+
 
         fprintf(stdout, "--------------- [S->C] --------------\n");
         fprintf(stdout, "%s", sendBuf);
@@ -189,7 +443,7 @@ void RTSP::serve_client(int clientfd, const sockaddr_in &cliAddr, int rtpFD, con
             break;
         }
 
-        if (!strcmp(method, "PLAY")) {
+        if (method== "PLAY") {
             char IPv4[16]{0};
             inet_ntop(AF_INET, &cliAddr.sin_addr, IPv4, sizeof(IPv4));
 
@@ -201,30 +455,126 @@ void RTSP::serve_client(int clientfd, const sockaddr_in &cliAddr, int rtpFD, con
 
             fprintf(stdout, "start send stream to %s:%d\n", IPv4, ntohs(clientSock.sin_port));
 
-            //uint32_t tmpTimeStamp = 0;
-            const auto timeStampStep = uint32_t(90000 / fps);
-            const auto sleepPeriod = uint32_t(1000 * 1000 / fps);
-            RtpHeader rtpHeader(0, 0, ssrcNum);
-            RtpPacket rtpPack{rtpHeader};
-
-            while (true) {
-                auto cur_frame = this->h264_file.get_next_frame();
-                const auto ptr_cur_frame = cur_frame.first;
-                const auto cur_frame_size = cur_frame.second;
-
-                if (cur_frame_size < 0) {
-                    fprintf(stderr, "RTSP::serve_client() H264::getOneFrame() failed\n");
-                    break;
-                } else if (!cur_frame_size) {
-                    fprintf(stdout, "Finish serving the user\n");
-                    return;
+            while(1){
+                // Open the codec
+                if (avcodec_open2(c, codec, nullptr) < 0)
+                {
+                    std::cerr << "Could not open codec." << std::endl;
+                    exit(0);
                 }
 
-                const int64_t start_code_len = H264Parser::is_start_code(ptr_cur_frame, cur_frame_size, 4) ? 4 : 3;
-                RTSP::push_stream(rtpFD, rtpPack, ptr_cur_frame + start_code_len, cur_frame_size - start_code_len, (sockaddr *)&clientSock, timeStampStep);
-                usleep(sleepPeriod);
+                f = fopen("hello.h264", "wb");
+                if (!f)
+                {
+                    fprintf(stderr, "Could not open %s\n", "hello.h264");
+                    exit(0);
+                }
+
+                AVPacket* pkt = av_packet_alloc();
+                if (!pkt)
+                    exit(1);
+
+                const auto timeStampStep = uint32_t(90000 / fps);
+                const auto sleepPeriod = uint32_t(1000 * 1000 / fps);
+                RtpHeader rtpHeader(0, 0, ssrcNum);
+                RtpPacket rtpPack{rtpHeader};
+
+
+                // Step 1: Convert PNG to YUV
+                //int width, height;
+                //std::vector<uint8_t> yuv_data = convertPNGToYUV420P(file_name, width, height);
+                //std::cout << "loadImg - width : " << width << " height : " << height << std::endl;
+
+                
+
+                // Step 2: make Frame
+                std::cout<<"Step2\n";
+                AVFrame *frame = av_frame_alloc();
+                if(!frame){
+                    fprintf(stderr, "Could not allcate video frame\n");
+                    exit(1);
+                }
+                frame->format = c->pix_fmt;
+                frame->width = c->width;
+                frame->height = c->height;
+
+                std::cout<<"Step3\n";
+                ret = av_frame_get_buffer(frame, 32);
+                if(ret < 0){
+                    std::cout << AVERROR(ret) << std::endl;
+                    fprintf(stderr, "Could not allcate video frame data\n");
+                    exit(1);
+                }
+                std::cout << ret << std::endl;
+
+                std::cout<<"start frame process\n";
+                // encode 1 second of video
+                for(i =0; i<25; i++) {
+                    fflush(stdout);
+
+                    ret = av_frame_make_writable(frame);
+                    if(ret<0)
+                        exit(1);
+
+                    /* prepare a dummy image */
+                    /* Y */
+                    for (y = 0; y < c->height; y++)
+                    {
+                        for (x = 0; x < c->width; x++)
+                        {
+                            frame->data[0][y * frame->linesize[0] + x] = 255; // Y 값 최대화
+                        }
+                    }
+                    /* Cb and Cr */
+                    for (y = 0; y < c->height / 2; y++)
+                    {
+                        for (x = 0; x < c->width / 2; x++)
+                        {
+                            frame->data[1][y * frame->linesize[1] + x] = 128; // Cb 중립값
+                            frame->data[2][y * frame->linesize[2] + x] = 128; // Cr 중립값
+                        }
+                    }
+
+                    /* Y */
+                    // for (y = 0; y < c->height; y++)
+                    // {
+                    //     for (x = 0; x < c->width; x++)
+                    //     {
+                    //         frame->data[0][y * frame->linesize[0] + x] = x + y + i * 3;
+                    //     }
+                    // }
+                    // /* Cb and Cr */
+                    // for (y = 0; y < c->height / 2; y++)
+                    // {
+                    //     for (x = 0; x < c->width / 2; x++)
+                    //     {
+                    //         frame->data[1][y * frame->linesize[1] + x] = 128 + y + i * 2;
+                    //         frame->data[2][y * frame->linesize[2] + x] = 64 + x + i * 5;
+                    //     }
+                    // }
+                    frame->pts = i;
+
+                    //encode the image
+                    encode(c, frame, pkt, f);
+                }
+                std::cout<<"end frame process\n";
+                //flush the encoder
+                uint8_t endcode[] = { 0, 0, 1, 0xb7 };
+                encode(c, NULL, pkt, f);
+                fwrite(endcode, 1, sizeof(endcode), f);
+                fclose(f);
+
+                stream_h264_rtp("hello.h264", clientSock, server_rtp_sock_fd, this->client_rtp_port);
+                //avcodec_free_context(&c);
+                //avcodec_flush_buffers(c);   //context는 그대로, 버퍼만 초기화
+                avcodec_close(c);
+                av_frame_free(&frame);
+                av_packet_free(&pkt);
+                
+                //std::cout << "end.\n";
+                //return;
+                //break;
             }
-            break;
         }
     }
     fprintf(stdout, "finish\n");

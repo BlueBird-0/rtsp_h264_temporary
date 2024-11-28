@@ -1,3 +1,11 @@
+/*
+ * @Author: your name
+ * @Date: 2021-06-10 21:21:44
+ * @LastEditTime: 2021-08-07 11:23:26
+ * @LastEditors: Wade
+ * @Description: In User Settings Edit
+ * @FilePath: /rtsp/include/H264.h
+ */
 #pragma once
 
 #include <utility>
